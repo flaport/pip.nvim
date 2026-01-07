@@ -52,15 +52,17 @@ local function start_job(name, on_exit)
     ---@type string?
     local stdout_str = nil
 
+    -- Use curl to fetch from PyPI JSON API
+    local url = string.format("https://pypi.org/pypi/%s/json", name)
     local opts = {
-        args = { "pip", "index", "versions", name, "--output-format", "json" },
+        args = { "-sL", "--retry", "1", url },
         stdio = { nil, stdout, stderr },
     }
 
     local handle, _pid
     ---@param code integer
     ---@param _signal integer
-    handle, _pid = vim.loop.spawn("uv", opts, function(code, _signal)
+    handle, _pid = vim.loop.spawn("curl", opts, function(code, _signal)
         handle:close()
 
         local success = code == 0
@@ -144,28 +146,34 @@ function M.parse_package(json, name)
         return nil
     end
 
-    -- uv pip index versions returns:
+    -- PyPI JSON API returns:
     -- {
-    --   "name": "package-name",
-    --   "versions": ["1.0.0", "1.0.1", ...],
-    --   "latest": "1.0.1"
+    --   "info": { "name": "...", "summary": "...", ... },
+    --   "releases": { "1.0.0": [...], "1.0.1": [...], ... }
     -- }
 
-    local versions_list = json.versions
-    if not versions_list then
+    local info = json.info
+    local releases = json.releases
+    if not releases then
         return nil
     end
 
     ---@type ApiVersion[]
     local versions = {}
 
-    for _, vers_str in ipairs(versions_list) do
+    for vers_str, release_files in pairs(releases) do
         local parsed = semver.parse_version(vers_str)
+        -- Check if yanked (any file in the release is yanked)
+        local yanked = false
+        if type(release_files) == "table" and #release_files > 0 then
+            yanked = release_files[1].yanked or false
+        end
+
         ---@type ApiVersion
         local version = {
             num = vers_str,
             parsed = parsed,
-            yanked = false, -- uv doesn't include yanked versions by default
+            yanked = yanked,
         }
         table.insert(versions, version)
     end
@@ -180,9 +188,12 @@ function M.parse_package(json, name)
 
     ---@type ApiPackage
     local package = {
-        name = json.name or name,
-        summary = nil, -- uv pip index doesn't provide this
+        name = info and info.name or name,
+        summary = info and info.summary,
         versions = versions,
+        homepage = info and info.home_page,
+        documentation = info and info.docs_url,
+        repository = info and info.project_urls and info.project_urls.Repository,
         pypi_url = "https://pypi.org/project/" .. name,
     }
 
