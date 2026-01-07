@@ -124,8 +124,17 @@ function M.parse_section(text, line_nr, header_col)
     ---@type TomlSection?
     local section = nil
 
+    -- [project] - main project section (contains dependencies = [...])
+    if text:match("^%s*project%s*$") then
+        section = {
+            text = text,
+            invalid = false,
+            kind = TomlSectionKind.DEPENDENCIES,
+            lines = Span.new(line_nr, nil),
+            header_col = header_col,
+        }
     -- [project.dependencies]
-    if text:match("^%s*project%.dependencies%s*$") then
+    elseif text:match("^%s*project%.dependencies%s*$") then
         section = {
             text = text,
             invalid = false,
@@ -411,7 +420,25 @@ function M.parse_packages(buf)
             end
         elseif current_section then
             -- Check if we're starting or continuing an array
-            if trimmed:match("^%s*[%w_-]+%s*=%s*%[") then
+            local array_key = trimmed:match("^%s*([%w_-]+)%s*=%s*%[")
+            if array_key then
+                -- Only parse arrays that are relevant to the section type
+                -- In [project] section, only parse "dependencies" key
+                -- In [project.optional-dependencies], parse any key (group names)
+                -- In [dependency-groups], parse any key (group names)
+                local should_parse = false
+                if current_section.kind == TomlSectionKind.DEPENDENCIES then
+                    should_parse = (array_key == "dependencies")
+                elseif current_section.kind == TomlSectionKind.OPTIONAL_DEPENDENCIES then
+                    should_parse = true -- any key is a group name
+                elseif current_section.kind == TomlSectionKind.DEV_DEPENDENCIES then
+                    should_parse = true
+                end
+
+                if not should_parse then
+                    goto continue
+                end
+
                 -- Start of array (e.g., "dependencies = [" or "dev = [")
                 in_array = true
                 -- Check if array closes on the same line
@@ -462,6 +489,7 @@ function M.parse_packages(buf)
                     end
                 end
             end
+            ::continue::
         end
     end
 
