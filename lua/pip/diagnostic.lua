@@ -186,9 +186,29 @@ function M.process_api_package(pkg, api_pkg, diagnostics)
 
     if newest then
         if semver.matches_requirements(newest.parsed, pkg:vers_reqs()) then
-            -- version matches, no upgrade available
+            -- version matches the requirement
             info.vers_match = newest
             info.match_kind = MatchKind.VERSION
+
+            -- Check if the newest version is higher than what's specified
+            -- If so, show it as an upgrade available
+            local reqs = pkg:vers_reqs()
+            if reqs and #reqs > 0 then
+                -- Compare newest version against the first requirement's version
+                local req_vers = reqs[1].vers
+                if req_vers and newest.parsed and semver.compare(newest.parsed, req_vers) > 0 then
+                    info.vers_upgrade = newest
+                    info.vers_match = nil -- Don't show the blue version, only orange upgrade
+                    if state.cfg.enable_update_available_warning then
+                        table.insert(diagnostics, package_diagnostic(
+                            pkg,
+                            PipDiagnosticKind.VERS_UPGRADE,
+                            vim.diagnostic.severity.WARN,
+                            PackageScope.VERS
+                        ))
+                    end
+                end
+            end
         else
             -- version does not match, upgrade available
             local match, match_pre, match_yanked = util.get_newest(versions, pkg:vers_reqs())
