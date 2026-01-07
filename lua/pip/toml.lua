@@ -327,6 +327,54 @@ function M.parse_array_items(text, line_nr, col_offset)
     return packages
 end
 
+-- Parse a single line that contains a quoted package spec
+---@param line string
+---@param line_nr integer
+---@return TomlPackage?
+function M.parse_package_line(line, line_nr)
+    -- Match quoted string: "package>=1.0" or 'package>=1.0'
+    local quote_s, quote_char, spec, quote_e = line:match('^%s*()(["\'])(.-)%2()%s*,?%s*$')
+    if not spec or spec == "" then
+        return nil
+    end
+
+    local col_offset = quote_s
+    local name, name_col, vers_text, vers_col, extras = M.parse_pep508_spec(spec, col_offset)
+
+    if not name or name == "" then
+        return nil
+    end
+
+    ---@type TomlPackage
+    local pkg = {
+        explicit_name = name,
+        explicit_name_col = name_col,
+        lines = Span.new(line_nr, line_nr + 1),
+        syntax = TomlPackageSyntax.PLAIN,
+    }
+
+    if vers_text then
+        pkg.vers = {
+            text = vers_text,
+            line = line_nr,
+            col = vers_col,
+            decl_col = Span.new(quote_s - 1, quote_e - 1),
+        }
+    end
+
+    if extras then
+        pkg.extras = {
+            items = extras,
+            line = line_nr,
+            col = name_col,
+            decl_col = name_col,
+            text = table.concat(extras, ","),
+        }
+    end
+
+    return pkg
+end
+
 ---@param buf integer
 ---@return TomlSection[]
 ---@return TomlPackage[]
@@ -341,10 +389,6 @@ function M.parse_packages(buf)
     local current_section = nil
     ---@type boolean
     local in_array = false
-    ---@type string[]
-    local array_lines = {}
-    ---@type integer
-    local array_start_line = 0
 
     for i, line in ipairs(lines) do
         local line_nr = i - 1
@@ -357,18 +401,7 @@ function M.parse_packages(buf)
             if current_section then
                 current_section.lines.e = line_nr
             end
-
-            -- Handle multiline arrays that weren't closed
-            if in_array and current_section then
-                local full_text = table.concat(array_lines, "")
-                local parsed = M.parse_array_items(full_text, array_start_line, 0)
-                for _, pkg in ipairs(parsed) do
-                    pkg.section = current_section
-                    table.insert(packages, Package.new(pkg))
-                end
-            end
             in_array = false
-            array_lines = {}
 
             local header_col = Span.new(section_start - 1, section_end - 1)
             current_section = M.parse_section(section_text, line_nr, header_col)
@@ -377,69 +410,55 @@ function M.parse_packages(buf)
                 table.insert(sections, current_section)
             end
         elseif current_section then
-            -- Handle multiline arrays
-            if in_array then
-                table.insert(array_lines, trimmed)
+            -- Check if we're starting or continuing an array
+            if trimmed:match("^%s*[%w_-]+%s*=%s*%[") then
+                -- Start of array (e.g., "dependencies = [" or "dev = [")
+                in_array = true
+                -- Check if array closes on the same line
                 if trimmed:match("%]%s*$") then
                     in_array = false
-                    local full_text = table.concat(array_lines, "")
-                    local parsed = M.parse_array_items(full_text, array_start_line, 0)
-                    for _, pkg in ipairs(parsed) do
+                end
+                -- Parse any packages on this line (single-line array)
+                local bracket_pos = trimmed:find("%[")
+                if bracket_pos then
+                    local array_content = trimmed:sub(bracket_pos)
+                    -- Parse inline packages on this line
+                    for quote_s, qchar, spec in array_content:gmatch('()(["\'])(.-)%2') do
+                        if spec and spec ~= "" then
+                            local col_offset = bracket_pos + quote_s
+                            local name, name_col, vers_text, vers_col, extras = M.parse_pep508_spec(spec, col_offset)
+                            if name and name ~= "" then
+                                ---@type TomlPackage
+                                local pkg = {
+                                    explicit_name = name,
+                                    explicit_name_col = name_col,
+                                    lines = Span.new(line_nr, line_nr + 1),
+                                    syntax = TomlPackageSyntax.PLAIN,
+                                    section = current_section,
+                                }
+                                if vers_text then
+                                    pkg.vers = {
+                                        text = vers_text,
+                                        line = line_nr,
+                                        col = vers_col,
+                                        decl_col = Span.new(col_offset - 1, col_offset + #spec),
+                                    }
+                                end
+                                table.insert(packages, Package.new(pkg))
+                            end
+                        end
+                    end
+                end
+            elseif in_array then
+                -- Check if array ends
+                if trimmed:match("^%s*%]") then
+                    in_array = false
+                else
+                    -- Parse package on this line
+                    local pkg = M.parse_package_line(trimmed, line_nr)
+                    if pkg then
                         pkg.section = current_section
                         table.insert(packages, Package.new(pkg))
-                    end
-                    array_lines = {}
-                end
-            else
-                -- Check for array start (dependencies = [...] or group = [...])
-                local key_name, array_start = trimmed:match("^%s*([%w_-]*)%s*=%s*(%[.*)$")
-                if array_start then
-                    -- Check if it's a single-line array
-                    if array_start:match("%]%s*$") then
-                        local parsed = M.parse_array_items(array_start, line_nr, trimmed:find("%[") - 1)
-                        for _, pkg in ipairs(parsed) do
-                            pkg.section = current_section
-                            table.insert(packages, Package.new(pkg))
-                        end
-                    else
-                        -- Start of multiline array
-                        in_array = true
-                        array_start_line = line_nr
-                        array_lines = { array_start }
-                    end
-                else
-                    -- Check for simple quoted string on its own line (inside an array)
-                    local quote_char, spec = trimmed:match('^%s*(["\'])(.-)%1%s*,?%s*$')
-                    if spec and spec ~= "" then
-                        local name, name_col, vers_text, vers_col, extras = M.parse_pep508_spec(spec, trimmed:find(quote_char) or 0)
-                        if name and name ~= "" then
-                            ---@type TomlPackage
-                            local pkg = {
-                                explicit_name = name,
-                                explicit_name_col = name_col,
-                                lines = Span.new(line_nr, line_nr + 1),
-                                syntax = TomlPackageSyntax.PLAIN,
-                                section = current_section,
-                            }
-                            if vers_text then
-                                pkg.vers = {
-                                    text = vers_text,
-                                    line = line_nr,
-                                    col = vers_col,
-                                    decl_col = Span.new(0, #trimmed),
-                                }
-                            end
-                            if extras then
-                                pkg.extras = {
-                                    items = extras,
-                                    line = line_nr,
-                                    col = name_col,
-                                    decl_col = name_col,
-                                    text = table.concat(extras, ","),
-                                }
-                            end
-                            table.insert(packages, Package.new(pkg))
-                        end
                     end
                 end
             end
@@ -449,16 +468,6 @@ function M.parse_packages(buf)
     -- Close last section
     if current_section then
         current_section.lines.e = #lines
-    end
-
-    -- Handle any remaining multiline array
-    if in_array and current_section then
-        local full_text = table.concat(array_lines, "")
-        local parsed = M.parse_array_items(full_text, array_start_line, 0)
-        for _, pkg in ipairs(parsed) do
-            pkg.section = current_section
-            table.insert(packages, Package.new(pkg))
-        end
     end
 
     return sections, packages
