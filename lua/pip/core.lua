@@ -13,6 +13,22 @@ local M = {
     throttled_updates = {},
 }
 
+---@param buf integer
+local function redisplay_all_package_info(buf)
+    local cache = state.buf_cache[buf]
+    if not cache then
+        return
+    end
+
+    -- Collect all infos
+    local all_infos = {}
+    for _, info in pairs(cache.info) do
+        table.insert(all_infos, info)
+    end
+
+    ui.display_package_info(buf, all_infos)
+end
+
 ---@type fun(package_name: string)
 M.load_package = async.wrap(function(package_name)
     local pkg, cancelled = api.fetch_package(package_name)
@@ -26,6 +42,7 @@ M.load_package = async.wrap(function(package_name)
 
     for buf, cache in pairs(state.buf_cache) do
         -- update package in all dependency sections
+        local needs_redisplay = false
         for k, p in pairs(cache.packages) do
             local normalized_name = util.normalize_package_name(p:package())
             local normalized_fetch = util.normalize_package_name(package_name)
@@ -36,9 +53,14 @@ M.load_package = async.wrap(function(package_name)
                 cache.info[k] = info
                 vim.list_extend(cache.diagnostics, p_diagnostics)
 
-                ui.display_package_info(buf, { info })
                 ui.display_diagnostics(buf, {}, p_diagnostics)
+                needs_redisplay = true
             end
+        end
+
+        -- Redisplay all package info to maintain alignment
+        if needs_redisplay then
+            redisplay_all_package_info(buf)
         end
     end
 end)
